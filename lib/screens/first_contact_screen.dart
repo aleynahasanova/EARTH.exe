@@ -43,7 +43,7 @@ class FirstContactScreen extends StatelessWidget {
               const SizedBox(height: 32),
 
               const Text('human\ncomputing.', style: AppTextStyles.display),
-
+ 
               const SizedBox(height: 12),
 
               const Text(
