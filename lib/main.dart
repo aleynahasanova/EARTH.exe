@@ -1,11 +1,22 @@
 import 'package:flutter/material.dart';
 
+import 'database/database_helper.dart';
 import 'screens/first_contact_screen.dart';
 import 'theme/app_theme.dart';
 
-//import 'screens/llm_test_screen.dart';
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
 
-void main() {
+  // Open the local database before the UI starts so any problem shows up
+  // immediately in the console, tagged [DB].
+  try {
+    await DatabaseHelper.instance.database;
+    await DatabaseHelper.instance.purgeEmptySessions();
+    await DatabaseHelper.instance.debugDump();
+  } catch (e, st) {
+    debugPrint('[DB][ERROR] startup failed: $e\n$st');
+  }
+
   runApp(const EarthExeApp());
 }
 

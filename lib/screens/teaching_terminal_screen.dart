@@ -19,7 +19,18 @@ import 'mothership_report_screen.dart';
 class TeachingTerminalScreen extends StatefulWidget {
   final String domain;
 
-  const TeachingTerminalScreen({super.key, required this.domain});
+  /// When set, the saved session is loaded from SQLite instead of starting a new one.
+  final int? sessionId;
+
+  /// Archived view of a finished session: no input, no model.
+  final bool readOnly;
+
+  const TeachingTerminalScreen({
+    super.key,
+    required this.domain,
+    this.sessionId,
+    this.readOnly = false,
+  });
 
   @override
   State<TeachingTerminalScreen> createState() => _TeachingTerminalScreenState();
@@ -29,7 +40,8 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
   final TextEditingController controller = TextEditingController();
   final ScrollController scrollController = ScrollController();
 
-  final LocalLlmService _llm = LocalLlmService();
+  // Not created in read-only mode (no model needed to read an archive).
+  LocalLlmService? _llm;
   final LearningEngine _learningEngine = LearningEngine();
 
   late final ConceptPack _pack = X7Script.packFor(widget.domain);
@@ -40,59 +52,132 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
   final List<String> _studentAnswers = [];
 
   int? _sessionId;
-  MothershipReport? _report;
   bool _reportBusy = false;
 
   bool _modelLoading = true;
+  bool _restoring = false;
   bool _generating = false;
   bool _finished = false;
   String? _error;
+  String? _dbWarning;
 
   @override
   void initState() {
     super.initState();
-    _messages.add(
-      _ChatMessage(sender: 'X-7', message: _pack.opening, alien: true),
-    );
-    _startSession();
-    _loadModel();
-  }
 
-  // ---------------------------------------------------------------------------
-  // SQLITE (every call is wrapped: a database problem must never break the demo)
-  // ---------------------------------------------------------------------------
+    _sessionId = widget.sessionId;
 
-  Future<void> _startSession() async {
-    try {
-      final id = await DatabaseHelper.instance.createSession(
-        TeachingSession(
-          domain: widget.domain,
-          concept: _pack.title,
-          startedAt: DateTime.now(),
-        ),
-      );
-      _sessionId = id;
-      await _log('X-7', _pack.opening);
-    } catch (e) {
-      debugPrint('DB startSession failed: $e');
+    if (widget.sessionId != null) {
+      _restoring = true;
+      _restoreSession(widget.sessionId!);
+    } else {
+      _messages.add(_openingMessage());
+    }
+
+    if (widget.readOnly) {
+      _modelLoading = false;
+    } else {
+      _llm = LocalLlmService();
+      _loadModel();
     }
   }
 
-  Future<void> _log(String sender, String content) async {
-    final id = _sessionId;
-    if (id == null) return;
+  _ChatMessage _openingMessage() =>
+      _ChatMessage(sender: 'X-7', message: _pack.opening, alien: true);
 
+  // ---------------------------------------------------------------------------
+  // SQLITE
+  // Failures never crash the app, but they are NEVER silent:
+  // they print "[DB][ERROR]" in the console and show a warning on screen.
+  // ---------------------------------------------------------------------------
+
+  Future<void> _persist(String what, Future<void> Function() action) async {
     try {
-      await DatabaseHelper.instance.addMessage(
-        Message(
-          sessionId: id,
-          sender: sender,
-          content: content,
-          createdAt: DateTime.now(),
-        ),
+      await action();
+    } catch (e, st) {
+      debugPrint('[DB][ERROR] $what failed: $e\n$st');
+      if (mounted) {
+        setState(() => _dbWarning = 'LOCAL LOG WRITE FAILED // $what');
+      }
+    }
+  }
+
+  /// The session row is created on the FIRST accepted answer, so opening a
+  /// domain and leaving again never leaves an empty session behind.
+  Future<void> _ensureSession() async {
+    if (_sessionId != null) return;
+
+    final id = await DatabaseHelper.instance.createSession(
+      TeachingSession(
+        domain: widget.domain,
+        concept: _pack.title,
+        startedAt: DateTime.now(),
+      ),
+    );
+
+    _sessionId = id;
+    await _saveMessage('X-7', _pack.opening);
+  }
+
+  Future<void> _saveMessage(String sender, String content) async {
+    await DatabaseHelper.instance.addMessage(
+      Message(
+        sessionId: _sessionId!,
+        sender: sender,
+        content: content,
+        createdAt: DateTime.now(),
+      ),
+    );
+  }
+
+  /// Rebuilds the chat, the phase and the student answers from SQLite.
+  Future<void> _restoreSession(int id) async {
+    try {
+      final saved = await DatabaseHelper.instance.getMessagesForSession(id);
+
+      final restored = <_ChatMessage>[];
+      final answers = <String>[];
+
+      for (final m in saved) {
+        final alien = m.sender.startsWith('X-7');
+        restored.add(
+          _ChatMessage(sender: m.sender, message: m.content, alien: alien),
+        );
+        if (!alien) answers.add(m.content);
+      }
+
+      if (restored.isEmpty) restored.add(_openingMessage());
+
+      // 0 answers = EXPLAIN, 1 = CLARIFY ... 5 = CORRECT. A 6th answer finishes it.
+      for (var i = 0; i < answers.length && i < 5; i++) {
+        _learningEngine.advance();
+      }
+
+      debugPrint(
+        '[DB] restored session $id: ${saved.length} messages, '
+        '${answers.length} answers, next phase=${_learningEngine.phase.name}',
       );
-    } catch (e) {
-      debugPrint('DB addMessage failed: $e');
+
+      if (!mounted) return;
+      setState(() {
+        _messages
+          ..clear()
+          ..addAll(restored);
+        _studentAnswers
+          ..clear()
+          ..addAll(answers);
+        _finished = answers.length >= 6;
+        _restoring = false;
+      });
+      _scrollToBottom();
+    } catch (e, st) {
+      debugPrint('[DB][ERROR] restore session $id failed: $e\n$st');
+      if (!mounted) return;
+      setState(() {
+        if (_messages.isEmpty) _messages.add(_openingMessage());
+        _restoring = false;
+        _dbWarning = 'LOCAL LOG READ FAILED // restore session';
+      });
     }
   }
 
@@ -101,12 +186,15 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
   // ---------------------------------------------------------------------------
 
   Future<void> _loadModel() async {
+    final llm = _llm;
+    if (llm == null) return;
+
     try {
       final appDirectory = await getApplicationSupportDirectory();
       final modelPath =
           '${appDirectory.path}/models/qwen2.5-0.5b-instruct-q4_k_m.gguf';
 
-      await _llm.loadModel(modelPath);
+      await llm.loadModel(modelPath);
 
       if (!mounted) return;
       setState(() => _modelLoading = false);
@@ -121,13 +209,16 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
 
   /// One tiny stateless LLM call: a single dry reaction sentence.
   /// Returns null on any failure/timeout so the template still works.
-  Future<String?> _generateReaction(String studentMessage) async {
-    if (!_llm.isLoaded) return null;
+  Future<String?> _generateReaction(
+    LocalLlmService llm,
+    String studentMessage,
+  ) async {
+    if (!llm.isLoaded) return null;
 
     try {
       final buffer = StringBuffer();
 
-      final stream = _llm
+      final stream = llm
           .generate(
             systemPrompt: X7Script.reactionSystemPrompt,
             conversation: [
@@ -168,13 +259,16 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
   }
 
   Future<void> _sendMessage() async {
+    final llm = _llm;
     final studentMessage = controller.text.trim();
 
-    if (studentMessage.isEmpty ||
+    if (llm == null ||
+        studentMessage.isEmpty ||
         _generating ||
         _finished ||
+        _restoring ||
         _modelLoading ||
-        !_llm.isLoaded) {
+        !llm.isLoaded) {
       return;
     }
 
@@ -203,7 +297,7 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
         return;
       }
 
-      final raw = await _generateReaction(studentMessage);
+      final raw = await _generateReaction(llm, studentMessage);
       final reply = X7Script.compose(_pack, phase, raw);
 
       if (!mounted) return;
@@ -211,11 +305,16 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
       setState(() => _replaceLastAlienMessage(reply, label));
 
       _studentAnswers.add(studentMessage);
-      _log('HUMAN', studentMessage);
-      _log('X-7', reply);
+
+      // Save the exchange (in order) before moving on.
+      await _persist('save exchange', () async {
+        await _ensureSession();
+        await _saveMessage('HUMAN', studentMessage);
+        await _saveMessage(label, reply);
+      });
 
       if (phase == LearningPhase.correct) {
-        setState(() => _finished = true);
+        if (mounted) setState(() => _finished = true);
       } else {
         _learningEngine.advance();
       }
@@ -239,45 +338,57 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
   // REPORT
   // ---------------------------------------------------------------------------
 
+  /// Loads the saved report for this session, or creates and saves it.
+  Future<MothershipReport> _loadOrCreateReport() async {
+    final sid = _sessionId;
+
+    if (sid != null) {
+      try {
+        final existing = await DatabaseHelper.instance.getReportForSession(sid);
+        if (existing != null) return existing;
+      } catch (e, st) {
+        debugPrint('[DB][ERROR] load report failed: $e\n$st');
+      }
+    }
+
+    final created = MothershipReport(
+      sessionId: sid ?? 0,
+      reportContent: X7Script.buildReport(_pack, _studentAnswers),
+      createdAt: DateTime.now(),
+    );
+
+    if (sid != null) {
+      await _persist('save report', () async {
+        await DatabaseHelper.instance.completeSession(sid);
+        await DatabaseHelper.instance.createReport(created);
+      });
+    }
+
+    return created;
+  }
+
   Future<void> _openReport() async {
     if (_reportBusy) return;
     _reportBusy = true;
 
-    var report = _report;
+    final ready = await _loadOrCreateReport();
 
-    if (report == null) {
-      final sessionId = _sessionId ?? 0;
-
-      report = MothershipReport(
-        sessionId: sessionId,
-        reportContent: X7Script.buildReport(_pack, _studentAnswers),
-        createdAt: DateTime.now(),
-      );
-
-      if (_sessionId != null) {
-        try {
-          await DatabaseHelper.instance.completeSession(sessionId);
-          await DatabaseHelper.instance.createReport(report);
-        } catch (e) {
-          debugPrint('DB report save failed: $e');
-        }
-      }
-
-      _report = report;
-    }
-
-    final MothershipReport ready = report;
     _reportBusy = false;
 
     if (!mounted) return;
 
-    Navigator.push(
+    final transmitted = await Navigator.push<bool>(
       context,
       MaterialPageRoute(
         builder: (_) =>
             MothershipReportScreen(report: ready, domain: widget.domain),
       ),
     );
+
+    // "Transmit Report" returns true: go back to the Research Terminal.
+    if (transmitted == true && mounted) {
+      Navigator.pop(context);
+    }
   }
 
   void _scrollToBottom() {
@@ -295,7 +406,7 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
   void dispose() {
     controller.dispose();
     scrollController.dispose();
-    _llm.dispose();
+    _llm?.dispose();
     super.dispose();
   }
 
@@ -314,10 +425,20 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
               const SizedBox(height: 8),
               Text(_pack.title.toUpperCase(), style: AppTextStyles.heading),
               const SizedBox(height: 24),
+              if (_restoring)
+                const Padding(
+                  padding: EdgeInsets.only(bottom: 16),
+                  child: SystemLabel(text: 'RESTORING TRANSMISSION LOG...'),
+                ),
               if (_modelLoading)
                 const Padding(
                   padding: EdgeInsets.only(bottom: 16),
                   child: SystemLabel(text: 'INITIALIZING X-7 NEURAL CORE...'),
+                ),
+              if (_dbWarning != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: SystemLabel(text: '! $_dbWarning'),
                 ),
               if (_error != null)
                 Padding(
@@ -340,7 +461,14 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
                 ),
               ),
               const SizedBox(height: 16),
-              if (_finished) ...[
+              if (widget.readOnly) ...[
+                const SystemLabel(text: 'Archived transmission // Read only'),
+                const SizedBox(height: 12),
+                TerminalButton(
+                  label: 'Back to Report',
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ] else if (_finished) ...[
                 const SystemLabel(text: 'TRANSMISSION COMPLETE'),
                 const SizedBox(height: 12),
                 TerminalButton(
@@ -352,7 +480,7 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
                   controller: controller,
                   style: AppTextStyles.body,
                   maxLines: 3,
-                  enabled: !_modelLoading && !_generating,
+                  enabled: !_modelLoading && !_generating && !_restoring,
                   decoration: const InputDecoration(
                     hintText: '> Explain to X-7...',
                   ),
@@ -363,7 +491,9 @@ class _TeachingTerminalScreenState extends State<TeachingTerminalScreen> {
                       ? 'Receiving Transmission...'
                       : 'Send Transmission',
                   onPressed: () {
-                    if (!_generating && !_modelLoading) _sendMessage();
+                    if (!_generating && !_modelLoading && !_restoring) {
+                      _sendMessage();
+                    }
                   },
                 ),
               ],
