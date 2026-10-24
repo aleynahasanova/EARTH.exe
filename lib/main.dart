@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'screens/first_contact_screen.dart';
 import 'theme/app_theme.dart';
 
+//import 'screens/llm_test_screen.dart';
+
 void main() {
   runApp(const EarthExeApp());
 }

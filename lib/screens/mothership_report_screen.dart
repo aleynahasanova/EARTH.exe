@@ -1,12 +1,21 @@
 import 'package:flutter/material.dart';
 
+import '../ai/x7_script.dart';
+import '../models/mothership_report.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../widgets/system_label.dart';
 import '../widgets/terminal_button.dart';
 
 class MothershipReportScreen extends StatefulWidget {
-  const MothershipReportScreen({super.key});
+  final MothershipReport report;
+  final String domain;
+
+  const MothershipReportScreen({
+    super.key,
+    required this.report,
+    required this.domain,
+  });
 
   @override
   State<MothershipReportScreen> createState() => _MothershipReportScreenState();
@@ -14,6 +23,16 @@ class MothershipReportScreen extends StatefulWidget {
 
 class _MothershipReportScreenState extends State<MothershipReportScreen> {
   bool corrected = false;
+
+  late final ConceptPack _pack = X7Script.packFor(widget.domain);
+
+  String get _reportContent {
+    if (corrected) {
+      return X7Script.correctReport(_pack, widget.report.reportContent);
+    }
+
+    return widget.report.reportContent;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -24,8 +43,10 @@ class _MothershipReportScreenState extends State<MothershipReportScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const SystemLabel(
-                text: 'Mothership Report // Awaiting Verification',
+              SystemLabel(
+                text: corrected
+                    ? 'Mothership Report // Corrected'
+                    : 'Mothership Report // Awaiting Verification',
               ),
 
               const SizedBox(height: 32),
@@ -41,30 +62,23 @@ class _MothershipReportScreenState extends State<MothershipReportScreen> {
 
               const SizedBox(height: 32),
 
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: AppColors.surface,
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Text(
-                  corrected
-                      ? 'Database normalization organizes related '
-                            'information into appropriate tables to reduce '
-                            'unnecessary redundancy.\n\n'
-                            'Third Normal Form is a normalization rule. '
-                            'It does not mean that a database must contain '
-                            'exactly three tables.'
-                      : 'Database normalization organizes information '
-                            'into tables to reduce unnecessary redundancy.\n\n'
-                            'Third Normal Form means a database must '
-                            'contain exactly three tables.',
-                  style: AppTextStyles.body,
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: AppColors.surface,
+                      border: Border.all(
+                        color: corrected ? AppColors.accent : AppColors.border,
+                      ),
+                    ),
+                    child: Text(_reportContent, style: AppTextStyles.body),
+                  ),
                 ),
               ),
 
-              const Spacer(),
+              const SizedBox(height: 24),
 
               if (!corrected)
                 TerminalButton(
